@@ -95,9 +95,15 @@ tres tablas ficticias (determinaciones de sNfL, RM y brotes) con la misma
 estructura y efectos parecidos a los del estudio. Las cifras se parecen a las
 publicadas, pero no son las mismas.
 
-Los límites del umbral poblacional (PBT) del código son **ilustrativos**: para
-aplicarlo de verdad hay que sustituirlos por los límites de referencia
-publicados para la plataforma de medida.
+El umbral poblacional (PBT) usa los límites superiores de referencia
+(percentil 95) por décadas de edad establecidos con Lumipulse G en 282 sujetos
+sanos: Varelli M, Fasano S, Varriale F, Lavano A. Establishment of normal
+reference values for serum neurofilament light based on apparently healthy
+subjects aged 18–90 years. *Neurol Sci.* 2024;45:37.
+
+| Edad (años) | 18-29 | 30-39 | 40-49 | 50-59 | 60-69 | 70-90 |
+|---|---|---|---|---|---|---|
+| Límite superior (pg/mL) | 9,4 | 9,6 | 13,3 | 21,2 | 28,1 | 46,8 |
 
 ## Cómo reproducirlo
 

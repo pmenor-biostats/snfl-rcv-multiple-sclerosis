@@ -97,17 +97,17 @@ round(100 * RCV, 1)
     #> [1] 27.7
 
 ``` r
-# PBT: percentil 95 de sanos por décadas de edad (pg/mL).
-# ATENCIÓN: valores ilustrativos. Para usarlo de verdad, sustituir por los
-# límites de referencia publicados para la plataforma de medida.
+# PBT: límite superior de referencia (percentil 95) de sanos por décadas de
+# edad, medidos con Lumipulse G (Varelli et al., 282 sujetos; los mismos
+# límites que se usaron en el estudio)
 PBT_LIMITS <- tribble(
   ~age_min, ~age_max, ~upper_limit,
-  18,        29,       10.5,
-  30,        39,       12.0,
-  40,        49,       15.0,
-  50,        59,       19.0,
-  60,        69,       25.0,
-  70,        90,       33.0
+  18,        29,        9.4,
+  30,        39,        9.6,
+  40,        49,       13.3,
+  50,        59,       21.2,
+  60,        69,       28.1,
+  70,        90,       46.8
 )
 
 # Función renal: categorías KDIGO
@@ -143,9 +143,10 @@ nfl <- nfl |>
   mutate(pct_change = nfl / lag(nfl) - 1,
          rcv_bin    = as.integer(pct_change > RCV)) |>
   ungroup() |>
-  left_join(PBT_LIMITS, join_by(between(age, age_min, age_max, bounds = "[)"))) |>
+  mutate(age_years = floor(age)) |>   # años cumplidos, para asignar la década
+  left_join(PBT_LIMITS, join_by(between(age_years, age_min, age_max))) |>
   mutate(pbt_bin = as.integer(nfl > upper_limit)) |>
-  select(-age_min, -age_max)
+  select(-age_years, -age_min, -age_max)
 
 # Emparejar cada determinación con su RM y sus brotes
 prepare <- function(window_days) {
@@ -191,8 +192,8 @@ glimpse(analysis_df)
     #> $ diabetes       <fct> No, No, No, No, No, No, No, No, No, No, No, No, No, No,…
     #> $ pct_change     <dbl> NA, -0.45671800, 0.34799609, NA, -0.08643617, 0.0851528…
     #> $ rcv_bin        <int> NA, 0, 1, NA, 0, 0, 0, 0, 1, NA, 0, 0, NA, 0, NA, 0, 1,…
-    #> $ upper_limit    <dbl> 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,…
-    #> $ pbt_bin        <int> 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1…
+    #> $ upper_limit    <dbl> 13.3, 13.3, 13.3, 13.3, 13.3, 13.3, 13.3, 13.3, 13.3, 1…
+    #> $ pbt_bin        <int> 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1…
     #> $ relapse        <int> 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1…
     #> $ log_nfl        <dbl> 2.935451, 2.325325, 2.623944, 2.710713, 2.620311, 2.702…
     #> $ egfr_kdigo     <fct> G2 (60-89), G1 (>=90), G1 (>=90), G2 (60-89), G2 (60-89…
@@ -437,23 +438,23 @@ c(determinations = nrow(df_obj2), patients = n_distinct(df_obj2$patient_id))
 ```
 
     #> determinations       patients 
-    #>            628            247
+    #>            689            261
 
 ``` r
 fit_cluster_logit(mri_active ~ rcv_bin + pbt_bin + age_c + sex + egfr_bin, df_obj2)
 ```
 
     #>      term   or ci_low ci_high       p
-    #> 1 rcv_bin 3.28   2.01    5.35 2.0e-06
-    #> 2 pbt_bin 2.26   1.17    4.36 1.5e-02
+    #> 1 rcv_bin 3.32   2.07    5.32 6.8e-07
+    #> 2 pbt_bin 2.17   1.11    4.23 2.3e-02
 
 ``` r
 fit_cluster_logit(relapse    ~ rcv_bin + pbt_bin + age_c + sex + egfr_bin, df_obj2)
 ```
 
     #>      term   or ci_low ci_high       p
-    #> 1 rcv_bin 2.85   1.48    5.46 1.7e-03
-    #> 2 pbt_bin 6.57   2.63   16.43 5.6e-05
+    #> 1 rcv_bin 3.17   1.72    5.84 0.00023
+    #> 2 pbt_bin 4.83   1.84   12.65 0.00140
 
 **¿Coinciden RCV y PBT?** Kappa de Cohen y, en los casos discordantes,
 cuánta actividad hay en cada subgrupo.
@@ -465,8 +466,8 @@ tab_agree
 
     #>    PBT
     #> RCV   0   1
-    #>   0 399 103
-    #>   1  60  66
+    #>   0 403 153
+    #>   1  48  85
 
 ``` r
 po <- sum(diag(tab_agree)) / sum(tab_agree)
@@ -475,7 +476,7 @@ round(c(agreement = po, kappa = (po - pe) / (1 - pe)), 3)
 ```
 
     #> agreement     kappa 
-    #>     0.740     0.283
+    #>     0.708     0.280
 
 ``` r
 df_obj2 |>
@@ -489,8 +490,8 @@ df_obj2 |>
     #> # A tibble: 2 × 4
     #>   group         n mri_active_pct relapse_pct
     #>   <chr>     <int>          <dbl>       <dbl>
-    #> 1 PBT+/RCV-   103           14.6        18.4
-    #> 2 RCV+/PBT-    60           21.7        15
+    #> 1 PBT+/RCV-   153           11.1        13.1
+    #> 2 RCV+/PBT-    48           20.8        18.8
 
 ### 4.3. Objetivo 3: rendimiento diagnóstico
 
@@ -505,7 +506,7 @@ c(determinations = nrow(df_roc), patients = n_distinct(df_roc$patient_id),
 ```
 
     #> determinations       patients     mri_events relapse_events 
-    #>            640            251             82             54
+    #>            705            264             86             56
 
 ``` r
 roc_set <- function(outcome) {
@@ -537,28 +538,28 @@ auc_table(rocs_mri);  delong_table(rocs_mri)
 ```
 
     #>   marker   auc ci_low ci_high
-    #> 1    RCV 0.643  0.587   0.700
-    #> 2    PBT 0.611  0.554   0.668
-    #> 3   sNfL 0.653  0.585   0.721
+    #> 1    RCV 0.642  0.587   0.696
+    #> 2    PBT 0.599  0.543   0.655
+    #> 3   sNfL 0.653  0.586   0.719
 
     #>    comparison auc_diff     p
-    #> 1  RCV vs PBT    0.032 0.350
-    #> 2 sNfL vs PBT    0.043 0.031
-    #> 3 sNfL vs RCV    0.010 0.790
+    #> 1  RCV vs PBT    0.043 0.200
+    #> 2 sNfL vs PBT    0.053 0.031
+    #> 3 sNfL vs RCV    0.011 0.760
 
 ``` r
 auc_table(rocs_rel);  delong_table(rocs_rel)
 ```
 
     #>   marker   auc ci_low ci_high
-    #> 1    RCV 0.663  0.594   0.732
-    #> 2    PBT 0.727  0.662   0.791
-    #> 3   sNfL 0.768  0.698   0.838
+    #> 1    RCV 0.667  0.599   0.734
+    #> 2    PBT 0.689  0.625   0.752
+    #> 3   sNfL 0.774  0.706   0.842
 
-    #>    comparison auc_diff     p
-    #> 1  RCV vs PBT   -0.064 0.190
-    #> 2 sNfL vs PBT    0.041 0.036
-    #> 3 sNfL vs RCV    0.105 0.039
+    #>    comparison auc_diff      p
+    #> 1  RCV vs PBT   -0.022 0.6500
+    #> 2 sNfL vs PBT    0.085 0.0033
+    #> 3 sNfL vs RCV    0.107 0.0320
 
 ``` r
 roc_long <- bind_rows(
@@ -602,15 +603,15 @@ bind_rows(
 ```
 
     #>             label TP  FP  TN FN      sensitivity      specificity
-    #> 1 RM activa · RCV 37  92 466 45 45.1 (34.8-55.9) 83.5 (80.2-86.4)
-    #> 2 RM activa · PBT 38 135 423 44 46.3 (36.0-57.1) 75.8 (72.1-79.2)
-    #> 3     Brote · RCV 27 102 484 27 50.0 (37.1-62.9) 82.6 (79.3-85.4)
-    #> 4     Brote · PBT 37 136 450 17 68.5 (55.3-79.3) 76.8 (73.2-80.0)
+    #> 1 RM activa · RCV 38  98 521 48 44.2 (34.2-54.7) 84.2 (81.1-86.8)
+    #> 2 RM activa · PBT 45 201 418 41 52.3 (41.9-62.6) 67.5 (63.7-71.1)
+    #> 3     Brote · RCV 28 108 541 28 50.0 (37.3-62.7) 83.4 (80.3-86.0)
+    #> 4     Brote · PBT 39 207 442 17 69.6 (56.7-80.1) 68.1 (64.4-71.6)
     #>                ppv              npv
-    #> 1 28.7 (21.6-37.0) 91.2 (88.4-93.4)
-    #> 2 22.0 (16.4-28.7) 90.6 (87.6-92.9)
-    #> 3 20.9 (14.8-28.7) 94.7 (92.4-96.3)
-    #> 4 21.4 (15.9-28.1) 96.4 (94.2-97.7)
+    #> 1 27.9 (21.1-36.0) 91.6 (89.0-93.6)
+    #> 2 18.3 (14.0-23.6) 91.1 (88.1-93.3)
+    #> 3 20.6 (14.6-28.1) 95.1 (93.0-96.6)
+    #> 4 15.9 (11.8-20.9) 96.3 (94.1-97.7)
 
 **Punto de corte óptimo de sNfL continua** (índice de Youden), con IC
 por bootstrap (2.000 remuestreos). El umbral se calcula en log y se
@@ -626,11 +627,11 @@ youden_to_pgml(youden_boot(df_roc$mri_active, df_roc$log_nfl))
 ```
 
     #>        metric estimate ci_low ci_high
-    #> 1   threshold   23.790 12.569  25.314
-    #> 2 sensitivity    0.317  0.250   0.700
-    #> 3 specificity    0.948  0.585   0.968
-    #> 4         ppv    0.473  0.179   0.612
-    #> 5         npv    0.904  0.883   0.940
+    #> 1   threshold   23.790 12.695  25.314
+    #> 2 sensitivity    0.302  0.241   0.685
+    #> 3 specificity    0.950  0.619   0.967
+    #> 4         ppv    0.456  0.167   0.583
+    #> 5         npv    0.907  0.891   0.943
 
 ``` r
 youden_to_pgml(youden_boot(df_roc$relapse, df_roc$log_nfl))
@@ -638,10 +639,10 @@ youden_to_pgml(youden_boot(df_roc$relapse, df_roc$log_nfl))
 
     #>        metric estimate ci_low ci_high
     #> 1   threshold   14.010 12.875  19.930
-    #> 2 sensitivity    0.741  0.500   0.854
-    #> 3 specificity    0.703  0.640   0.906
-    #> 4         ppv    0.187  0.147   0.375
-    #> 5         npv    0.967  0.946   0.982
+    #> 2 sensitivity    0.750  0.500   0.857
+    #> 3 specificity    0.698  0.643   0.907
+    #> 4         ppv    0.176  0.139   0.373
+    #> 5         npv    0.970  0.950   0.984
 
 > El punto de corte de Youden se calcula y se evalúa con los mismos
 > datos, así que su rendimiento está sobrestimado. Es exploratorio.
@@ -753,7 +754,7 @@ lesions_b <- lesions |> filter(!is.na(rcv_bin), !is.na(pbt_bin))
 nrow(lesions_b)
 ```
 
-    #> [1] 69
+    #> [1] 71
 
 ``` r
 bind_rows(lapply(c("rcv_bin", "pbt_bin"), function(marker) {
@@ -763,17 +764,17 @@ bind_rows(lapply(c("rcv_bin", "pbt_bin"), function(marker) {
 })) |> select(label, sensitivity, specificity, npv)
 ```
 
-    #>                  label      sensitivity        specificity              npv
-    #> 1  RCV · >= 2 lesiones 93.5 (79.3-98.2)   28.9 (17.0-44.8) 84.6 (57.8-95.7)
-    #> 2  RCV · >= 3 lesiones 61.3 (43.8-76.3)   57.9 (42.2-72.1) 64.7 (47.9-78.5)
-    #> 3  RCV · >= 4 lesiones 48.4 (32.0-65.2)   73.7 (58.0-85.0) 63.6 (48.9-76.2)
-    #> 4  RCV · >= 5 lesiones 35.5 (21.1-53.1)   84.2 (69.6-92.6) 61.5 (48.0-73.5)
-    #> 5  RCV · >= 6 lesiones 29.0 (16.1-46.6)   89.5 (75.9-95.8) 60.7 (47.6-72.4)
-    #> 6  PBT · >= 2 lesiones 90.9 (76.4-96.9)   27.8 (15.8-44.0) 76.9 (49.7-91.8)
-    #> 7  PBT · >= 3 lesiones 69.7 (52.7-82.6)   66.7 (50.3-79.8) 70.6 (53.8-83.2)
-    #> 8  PBT · >= 4 lesiones 54.5 (38.0-70.2)   80.6 (65.0-90.2) 65.9 (51.1-78.1)
-    #> 9  PBT · >= 5 lesiones 48.5 (32.5-64.8)   97.2 (85.8-99.5) 67.3 (53.8-78.5)
-    #> 10 PBT · >= 6 lesiones 39.4 (24.7-56.3) 100.0 (90.4-100.0) 64.3 (51.2-75.5)
+    #>                  label      sensitivity      specificity              npv
+    #> 1  RCV · >= 2 lesiones 93.8 (79.9-98.3) 28.2 (16.5-43.8) 84.6 (57.8-95.7)
+    #> 2  RCV · >= 3 lesiones 62.5 (45.3-77.1) 56.4 (41.0-70.7) 64.7 (47.9-78.5)
+    #> 3  RCV · >= 4 lesiones 50.0 (33.6-66.4) 71.8 (56.2-83.5) 63.6 (48.9-76.2)
+    #> 4  RCV · >= 5 lesiones 37.5 (22.9-54.7) 82.1 (67.3-91.0) 61.5 (48.0-73.5)
+    #> 5  RCV · >= 6 lesiones 28.1 (15.6-45.4) 87.2 (73.3-94.4) 59.6 (46.7-71.4)
+    #> 6  PBT · >= 2 lesiones 89.7 (76.4-95.9) 28.1 (15.6-45.4) 69.2 (42.4-87.3)
+    #> 7  PBT · >= 3 lesiones 66.7 (51.0-79.4) 65.6 (48.3-79.6) 61.8 (45.0-76.1)
+    #> 8  PBT · >= 4 lesiones 51.3 (36.2-66.1) 78.1 (61.2-89.0) 56.8 (42.2-70.3)
+    #> 9  PBT · >= 5 lesiones 43.6 (29.3-59.0) 93.8 (79.9-98.3) 57.7 (44.2-70.1)
+    #> 10 PBT · >= 6 lesiones 33.3 (20.6-49.0) 96.9 (84.3-99.4) 54.4 (41.6-66.6)
 
 ``` r
 for (marker in c("rcv_bin", "pbt_bin")) {
@@ -784,13 +785,13 @@ for (marker in c("rcv_bin", "pbt_bin")) {
 ```
 
     #>   auc             
-    #> 0.669 0.544 0.794 
+    #> 0.664 0.540 0.788 
     #>   threshold specificity sensitivity
-    #> 1       1.5   0.2894737   0.9354839
+    #> 1       1.5   0.2820513      0.9375
     #>   auc             
-    #> 0.762 0.649 0.874 
+    #> 0.720 0.603 0.837 
     #>   threshold specificity sensitivity
-    #> 1       4.5   0.9722222   0.4848485
+    #> 1       4.5      0.9375   0.4358974
 
 > Con tan pocas determinaciones, estos puntos de corte son preliminares.
 
@@ -979,12 +980,12 @@ bind_rows(patient_level_auc("mri_active"), patient_level_auc("relapse"))
 ```
 
     #>   marker   auc ci_low ci_high    outcome patients
-    #> 1    RCV 0.632  0.562   0.701 mri_active      251
-    #> 2    PBT 0.591  0.522   0.661 mri_active      251
-    #> 3   sNfL 0.623  0.534   0.712 mri_active      251
-    #> 4    RCV 0.678  0.589   0.767    relapse      251
-    #> 5    PBT 0.701  0.613   0.788    relapse      251
-    #> 6   sNfL 0.757  0.665   0.849    relapse      251
+    #> 1    RCV 0.634  0.566   0.701 mri_active      264
+    #> 2    PBT 0.576  0.505   0.647 mri_active      264
+    #> 3   sNfL 0.623  0.536   0.710 mri_active      264
+    #> 4    RCV 0.673  0.586   0.761    relapse      264
+    #> 5    PBT 0.691  0.609   0.773    relapse      264
+    #> 6   sNfL 0.761  0.669   0.852    relapse      264
 
 ## 6. Figuras
 

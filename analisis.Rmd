@@ -77,17 +77,17 @@ CVI <- 0.0864
 RCV <- rcv_increase(CVA, CVI)   # aumento significativo frente a la determinación previa
 round(100 * RCV, 1)
 
-# PBT: percentil 95 de sanos por décadas de edad (pg/mL).
-# ATENCIÓN: valores ilustrativos. Para usarlo de verdad, sustituir por los
-# límites de referencia publicados para la plataforma de medida.
+# PBT: límite superior de referencia (percentil 95) de sanos por décadas de
+# edad, medidos con Lumipulse G (Varelli et al., 282 sujetos; los mismos
+# límites que se usaron en el estudio)
 PBT_LIMITS <- tribble(
   ~age_min, ~age_max, ~upper_limit,
-  18,        29,       10.5,
-  30,        39,       12.0,
-  40,        49,       15.0,
-  50,        59,       19.0,
-  60,        69,       25.0,
-  70,        90,       33.0
+  18,        29,        9.4,
+  30,        39,        9.6,
+  40,        49,       13.3,
+  50,        59,       21.2,
+  60,        69,       28.1,
+  70,        90,       46.8
 )
 
 # Función renal: categorías KDIGO
@@ -123,9 +123,10 @@ nfl <- nfl |>
   mutate(pct_change = nfl / lag(nfl) - 1,
          rcv_bin    = as.integer(pct_change > RCV)) |>
   ungroup() |>
-  left_join(PBT_LIMITS, join_by(between(age, age_min, age_max, bounds = "[)"))) |>
+  mutate(age_years = floor(age)) |>   # años cumplidos, para asignar la década
+  left_join(PBT_LIMITS, join_by(between(age_years, age_min, age_max))) |>
   mutate(pbt_bin = as.integer(nfl > upper_limit)) |>
-  select(-age_min, -age_max)
+  select(-age_years, -age_min, -age_max)
 
 # Emparejar cada determinación con su RM y sus brotes
 prepare <- function(window_days) {
