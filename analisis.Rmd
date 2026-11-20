@@ -1,0 +1,601 @@
+---
+title: "sNfL como biomarcador de actividad inflamatoria en la EMRR"
+subtitle: "pMenor · Estadística clínica en R"
+output:
+  github_document:
+    toc: true
+    fig_width: 7
+    fig_height: 4.7
+    dev: png
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      comment = "#>", fig.path = "output/", dpi = 144)
+```
+
+## 0. Cabecera
+
+**Artículo:** Serum neurofilament light chain as a biomarker of inflammatory
+activity in relapsing-remitting multiple sclerosis: a real-world longitudinal
+cohort study. *Clin Chem Lab Med* 2026.
+<https://doi.org/10.1515/cclm-2026-0944>
+
+**Objetivos**
+
+1. Estimar cuánto sube la cadena ligera de neurofilamentos en suero (sNfL)
+   con la actividad inflamatoria (brote clínico y RM activa), ajustando por
+   edad, función renal y otros factores.
+2. Comparar dos formas de interpretar un resultado: el **valor de referencia
+   del cambio (RCV)**, que compara con la determinación anterior del mismo
+   paciente, y el **umbral poblacional (PBT)**, que compara con sanos de la
+   misma edad.
+3. Medir el rendimiento diagnóstico de RCV, PBT y sNfL continua.
+4. Ver si la sNfL refleja la carga de lesiones nuevas en la RM.
+
+**Diseño.** Cohorte retrospectiva. Determinaciones de sNfL repetidas en
+pacientes con esclerosis múltiple remitente-recurrente (EMRR), emparejadas en
+el tiempo con RM y brotes clínicos.
+
+**Datos.** Tres tablas, como en la práctica clínica:
+
+| Tabla | Una fila por… | Variables |
+|---|---|---|
+| `data/nfl.csv`      | determinación de sNfL | `patient_id`, `nfl_date`, `nfl` (pg/mL), `age`, `years_since_dx`, `sex`, `smoking` (Never/Former/Current), `egfr` (mL/min/1,73 m²), `diabetes` |
+| `data/mri.csv`      | RM | `patient_id`, `mri_date`, `mri_active` (lesiones T2 nuevas: 1/0), `n_lesions` |
+| `data/relapses.csv` | brote confirmado | `patient_id`, `relapse_date` |
+
+> **Datos simulados.** Este repositorio no contiene datos de pacientes. Las
+> tres tablas las genera `R/simular_datos.R` con la misma estructura que los
+> datos reales y efectos parecidos a los publicados. Las cifras se parecen,
+> pero no son las del artículo.
+
+## 1. Configuración
+
+```{r config}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)         # modelos lineales mixtos
+library(performance)  # coeficiente de correlación intraclase (CCI)
+library(sandwich)     # errores estándar robustos por paciente
+library(lmtest)
+library(pROC)         # curvas ROC y test de DeLong
+
+source("R/funciones.R")
+source("R/theme_pmenor.R")
+usar_pmenor(base_size = 12, fondo = "papel")
+
+# Ventana temporal para emparejar sNfL con RM y brotes (días)
+WINDOW_DAYS  <- 90
+WINDOWS_SENS <- c(60, 90, 120)   # análisis de sensibilidad
+
+# RCV: variación analítica (CVA, control de calidad propio del laboratorio)
+# y biológica intraindividual (CVI, base de datos de variación biológica de la EFLM)
+CVA <- 0.060
+CVI <- 0.0864
+RCV <- rcv_increase(CVA, CVI)   # aumento significativo frente a la determinación previa
+round(100 * RCV, 1)
+
+# PBT: percentil 95 de sanos por décadas de edad (pg/mL).
+# ATENCIÓN: valores ilustrativos. Para usarlo de verdad, sustituir por los
+# límites de referencia publicados para la plataforma de medida.
+PBT_LIMITS <- tribble(
+  ~age_min, ~age_max, ~upper_limit,
+  18,        29,       10.5,
+  30,        39,       12.0,
+  40,        49,       15.0,
+  50,        59,       19.0,
+  60,        69,       25.0,
+  70,        90,       33.0
+)
+
+# Función renal: categorías KDIGO
+egfr_kdigo <- function(egfr) {
+  factor(case_when(is.na(egfr) ~ NA_character_,
+                   egfr >= 90  ~ "G1 (>=90)",
+                   egfr >= 60  ~ "G2 (60-89)",
+                   TRUE        ~ "G3-G5 (<60)"),
+         levels = c("G1 (>=90)", "G2 (60-89)", "G3-G5 (<60)"))
+}
+```
+
+> **Sobre la fórmula del RCV.** Se usa la versión log-normal (27,7 %), la
+> adecuada para la sNfL. La fórmula simétrica clásica daría un 24,5 %. Las
+> dos se explican en el README.
+
+## 2. Datos
+
+```{r data}
+if (!file.exists("data/nfl.csv")) source("R/simular_datos.R")
+
+read_dates <- \(f, cols) read.csv(f) |> mutate(across(all_of(cols), as.Date))
+nfl      <- read_dates("data/nfl.csv", "nfl_date")
+mri      <- read_dates("data/mri.csv", "mri_date")
+relapses <- read_dates("data/relapses.csv", "relapse_date")
+
+# RCV: cambio frente a la determinación anterior del mismo paciente.
+# La primera determinación de cada paciente no tiene RCV.
+# PBT: comparación con el límite superior de su década de edad.
+nfl <- nfl |>
+  arrange(patient_id, nfl_date) |>
+  group_by(patient_id) |>
+  mutate(pct_change = nfl / lag(nfl) - 1,
+         rcv_bin    = as.integer(pct_change > RCV)) |>
+  ungroup() |>
+  left_join(PBT_LIMITS, join_by(between(age, age_min, age_max, bounds = "[)"))) |>
+  mutate(pbt_bin = as.integer(nfl > upper_limit)) |>
+  select(-age_min, -age_max)
+
+# Emparejar cada determinación con su RM y sus brotes
+prepare <- function(window_days) {
+  match_events(select(nfl, patient_id, nfl_date), mri, relapses, window_days) |>
+    left_join(nfl, by = c("patient_id", "nfl_date")) |>
+    mutate(
+      mri_active = mri_active_w,
+      relapse    = relapse_w,
+      log_nfl    = log(nfl),
+      egfr_kdigo = egfr_kdigo(egfr),
+      egfr_bin   = factor(ifelse(egfr_kdigo == "G1 (>=90)", "G1", "G2-G5"), levels = c("G1", "G2-G5")),
+      sex        = factor(sex, levels = c("Female", "Male")),
+      smoking    = factor(smoking, levels = c("Never", "Former", "Current")),
+      diabetes   = factor(diabetes, levels = c("No", "Yes")),
+      # Edad y tiempo desde el diagnóstico centrados en la media de la cohorte
+      age_c      = age - mean(age, na.rm = TRUE),
+      t_dx_c     = years_since_dx - mean(years_since_dx, na.rm = TRUE)
+    )
+}
+analysis_df <- prepare(WINDOW_DAYS)
+
+glimpse(analysis_df)
+```
+
+## 3. Descriptivos
+
+```{r table-1}
+# Características por paciente (primera determinación) y por determinación
+analysis_df |>
+  summarise(
+    determinations    = n(),
+    patients          = n_distinct(patient_id),
+    dets_per_patient  = median(table(patient_id)),
+    age_median        = median(age),
+    years_dx_median   = median(years_since_dx),
+    nfl_median        = median(nfl),
+    nfl_q1            = quantile(nfl, 0.25),
+    nfl_q3            = quantile(nfl, 0.75),
+    mri_active_n      = sum(mri_active),
+    relapse_n         = sum(relapse)
+  ) |> as.data.frame()
+
+patients <- analysis_df |> arrange(patient_id, nfl_date) |> distinct(patient_id, .keep_all = TRUE)
+round(100 * prop.table(table(patients$sex)), 1)
+
+# Por determinación (pueden cambiar entre visitas, como la eGFR)
+lapply(analysis_df[c("smoking", "egfr_kdigo", "diabetes")], table, useNA = "ifany")
+```
+
+**Proximidad temporal.** ¿A cuántos días de la RM emparejada está cada
+determinación?
+
+```{r proximity}
+analysis_df |>
+  filter(!is.na(days_nfl_mri)) |>
+  group_by(mri_active) |>
+  summarise(n = n(), median_days = median(abs(days_nfl_mri)),
+            q1 = quantile(abs(days_nfl_mri), 0.25), q3 = quantile(abs(days_nfl_mri), 0.75),
+            within_30d_pct = round(100 * mean(abs(days_nfl_mri) <= 30), 1),
+            within_60d_pct = round(100 * mean(abs(days_nfl_mri) <= 60), 1))
+
+# Las "RM inactivas" incluyen las determinaciones sin RM dentro de la ventana
+analysis_df |>
+  filter(mri_active == 0) |>
+  count(mri_within_window = mri_within_w == 1)
+```
+
+```{r fig-activity, fig.cap = "sNfL según la actividad inflamatoria.", fig.width = 7.5}
+activity_long <- bind_rows(
+  analysis_df |> transmute(outcome = "RM", active = mri_active, nfl),
+  analysis_df |> transmute(outcome = "Brote clínico", active = relapse, nfl)
+) |>
+  mutate(outcome = factor(outcome, levels = c("RM", "Brote clínico")),
+         status  = factor(ifelse(active == 1, "Activa", "Inactiva"), levels = c("Inactiva", "Activa")))
+
+medians <- activity_long |> group_by(outcome, status) |> summarise(med = median(nfl), .groups = "drop")
+
+ggplot(activity_long, aes(status, nfl, colour = status)) +
+  geom_jitter(width = 0.2, alpha = 0.25, size = 0.8) +
+  geom_boxplot(outlier.shape = NA, width = 0.4, fill = NA, colour = pmenor_col[["tinta"]],
+               linewidth = grosor_pmenor(3)) +
+  geom_text(data = medians, aes(y = med, label = numeros_pmenor(accuracy = 0.1)(med)),
+            nudge_x = 0.23, hjust = 0, vjust = -0.4, colour = pmenor_col[["tinta"]], size = 3.2) +
+  scale_colour_manual(values = c(Inactiva = pmenor_col[["gris"]], Activa = pmenor_col[["burdeos"]]),
+                      guide = "none") +
+  scale_y_log10(labels = numeros_pmenor()) +
+  facet_wrap(~ outcome) +
+  labs(x = NULL, y = "sNfL (pg/mL, escala log)", caption = "Datos simulados")
+```
+
+## 4. Análisis principal
+
+### 4.1. Objetivo 1: ¿cuánto sube la sNfL con la actividad?
+
+Modelo lineal mixto sobre log(sNfL) con un intercepto aleatorio por paciente:
+cada paciente tiene su propio nivel basal y sus determinaciones no son
+independientes. Los coeficientes en escala log se pasan a **% de cambio**
+con (e^β − 1) × 100.
+
+El tratamiento modificador de la enfermedad no se incluye: la base de datos
+solo recogía el tratamiento actual, no el que tenía el paciente en cada
+determinación.
+
+```{r lmm}
+model_vars <- c("log_nfl", "relapse", "mri_active", "age_c", "t_dx_c",
+                "sex", "smoking", "egfr_kdigo", "diabetes", "patient_id")
+analysis_m1 <- analysis_df |> filter(if_all(all_of(model_vars), \(x) !is.na(x)))
+
+c(determinations = nrow(analysis_m1), patients = n_distinct(analysis_m1$patient_id),
+  excluded_missing = nrow(analysis_df) - nrow(analysis_m1))
+
+m1 <- lmer(log_nfl ~ relapse + mri_active + age_c + t_dx_c + sex + smoking +
+             egfr_kdigo + diabetes + (1 | patient_id),
+           data = analysis_m1, REML = TRUE)
+
+# CCI ajustado: qué parte de la variabilidad que queda se debe a diferencias
+# estables entre pacientes
+icc(m1)
+
+pct_change_table <- function(model) {
+  est <- fixef(model)
+  ci  <- confint(model, parm = "beta_", method = "Wald")
+  data.frame(term = names(est), beta = est,
+             t = coef(summary(model))[, "t value"],
+             pct_change = 100 * (exp(est) - 1),
+             ci_low = 100 * (exp(ci[, 1]) - 1), ci_high = 100 * (exp(ci[, 2]) - 1),
+             row.names = NULL) |>
+    filter(term != "(Intercept)") |>
+    mutate(across(where(is.numeric), \(x) round(x, 2)))
+}
+table_m1 <- pct_change_table(m1)
+table_m1
+```
+
+```{r fig-forest, fig.cap = "Efectos fijos del modelo mixto: % de cambio en la sNfL (IC 95 %)."}
+labels_m1 <- c(relapse = "Brote clínico (±90 d)", mri_active = "RM activa (±90 d)",
+               age_c = "Edad (por año)", t_dx_c = "Años desde el diagnóstico",
+               sexMale = "Varón (vs. mujer)", smokingFormer = "Exfumador (vs. nunca)",
+               smokingCurrent = "Fumador (vs. nunca)",
+               `egfr_kdigoG2 (60-89)` = "eGFR G2 (vs. G1)",
+               `egfr_kdigoG3-G5 (<60)` = "eGFR G3-G5 (vs. G1)", diabetesYes = "Diabetes")
+
+table_m1 |>
+  mutate(label = factor(labels_m1[term], levels = rev(labels_m1)),
+         key = term %in% c("relapse", "mri_active")) |>
+  ggplot(aes(pct_change, label)) +
+  geom_vline(xintercept = 0, colour = pmenor_col[["linea"]]) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0, colour = pmenor_col[["gris"]]) +
+  geom_point(aes(colour = key), size = 2.4) +
+  scale_colour_manual(values = c(`TRUE` = pmenor_col[["burdeos"]], `FALSE` = pmenor_col[["tinta"]]),
+                      guide = "none") +
+  scale_x_continuous(labels = \(x) paste0(ifelse(x > 0, "+", ""), x, " %")) +
+  labs(x = "Cambio en sNfL (IC 95 %)", y = NULL,
+       caption = "Datos simulados. Referencia: mujer, nunca fumadora, eGFR G1, sin diabetes.") +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_line(colour = pmenor_col[["linea"]]))
+```
+
+### 4.2. Objetivo 2: RCV y PBT como marcadores de actividad
+
+Regresión logística con la actividad como respuesta y RCV y PBT a la vez como
+explicativas, ajustada por edad, sexo y eGFR. Como un mismo paciente aporta
+varias determinaciones, los errores estándar son robustos por paciente
+(*cluster-robust*). Tabaquismo y diabetes no se incluyen: el RCV compara al
+paciente consigo mismo, así que los factores estables ya quedan controlados.
+
+```{r logistic}
+fit_cluster_logit <- function(formula, data) {
+  m  <- glm(formula, data = data, family = binomial)
+  ct <- coeftest(m, vcov. = vcovCL(m, cluster = data$patient_id, type = "HC0"))
+  data.frame(term = rownames(ct), or = exp(ct[, 1]),
+             ci_low = exp(ct[, 1] - 1.96 * ct[, 2]), ci_high = exp(ct[, 1] + 1.96 * ct[, 2]),
+             p = ct[, 4], row.names = NULL) |>
+    filter(term %in% c("rcv_bin", "pbt_bin")) |>
+    mutate(across(c(or, ci_low, ci_high), \(x) round(x, 2)), p = signif(p, 2))
+}
+
+df_obj2 <- analysis_df |> filter(!is.na(rcv_bin), !is.na(pbt_bin), !is.na(egfr_bin))
+c(determinations = nrow(df_obj2), patients = n_distinct(df_obj2$patient_id))
+
+fit_cluster_logit(mri_active ~ rcv_bin + pbt_bin + age_c + sex + egfr_bin, df_obj2)
+fit_cluster_logit(relapse    ~ rcv_bin + pbt_bin + age_c + sex + egfr_bin, df_obj2)
+```
+
+**¿Coinciden RCV y PBT?** Kappa de Cohen y, en los casos discordantes,
+cuánta actividad hay en cada subgrupo.
+
+```{r agreement}
+tab_agree <- table(RCV = df_obj2$rcv_bin, PBT = df_obj2$pbt_bin)
+tab_agree
+po <- sum(diag(tab_agree)) / sum(tab_agree)
+pe <- sum(rowSums(tab_agree) * colSums(tab_agree)) / sum(tab_agree)^2
+round(c(agreement = po, kappa = (po - pe) / (1 - pe)), 3)
+
+df_obj2 |>
+  filter(rcv_bin != pbt_bin) |>
+  mutate(group = ifelse(rcv_bin == 1, "RCV+/PBT-", "PBT+/RCV-")) |>
+  group_by(group) |>
+  summarise(n = n(), mri_active_pct = round(100 * mean(mri_active), 1),
+            relapse_pct = round(100 * mean(relapse), 1))
+```
+
+### 4.3. Objetivo 3: rendimiento diagnóstico
+
+Curvas ROC de RCV, PBT y sNfL continua (en log) frente a RM activa y frente a
+brote. Las AUC se comparan con el test de DeLong para curvas correlacionadas
+(las tres se calculan sobre las mismas determinaciones).
+
+```{r roc}
+df_roc <- analysis_df |> filter(!is.na(rcv_bin), !is.na(pbt_bin))
+c(determinations = nrow(df_roc), patients = n_distinct(df_roc$patient_id),
+  mri_events = sum(df_roc$mri_active), relapse_events = sum(df_roc$relapse))
+
+roc_set <- function(outcome) {
+  y <- df_roc[[outcome]]
+  list(RCV  = roc(y, df_roc$rcv_bin, quiet = TRUE, direction = "<", levels = c(0, 1)),
+       PBT  = roc(y, df_roc$pbt_bin, quiet = TRUE, direction = "<", levels = c(0, 1)),
+       sNfL = roc(y, df_roc$log_nfl, quiet = TRUE, direction = "<", levels = c(0, 1)))
+}
+auc_table <- function(rocs) {
+  bind_rows(lapply(names(rocs), function(m) {
+    ci <- ci.auc(rocs[[m]], method = "delong")
+    data.frame(marker = m, auc = ci[2], ci_low = ci[1], ci_high = ci[3])
+  })) |> mutate(across(where(is.numeric), \(x) round(x, 3)))
+}
+delong_table <- function(rocs) {
+  pairs <- list(c("RCV", "PBT"), c("sNfL", "PBT"), c("sNfL", "RCV"))
+  bind_rows(lapply(pairs, function(p) {
+    t <- roc.test(rocs[[p[1]]], rocs[[p[2]]], method = "delong")
+    data.frame(comparison = paste(p, collapse = " vs "),
+               auc_diff = round(as.numeric(auc(rocs[[p[1]]]) - auc(rocs[[p[2]]])), 3),
+               p = signif(t$p.value, 2))
+  }))
+}
+
+rocs_mri <- roc_set("mri_active")
+rocs_rel <- roc_set("relapse")
+
+auc_table(rocs_mri);  delong_table(rocs_mri)
+auc_table(rocs_rel);  delong_table(rocs_rel)
+```
+
+```{r fig-roc, fig.cap = "Curvas ROC de RCV, PBT y sNfL continua.", fig.width = 8, fig.height = 4.4}
+roc_long <- bind_rows(
+  bind_rows(lapply(names(rocs_mri), \(m) data.frame(marker = m, outcome = "RM activa",
+    fpr = 1 - rocs_mri[[m]]$specificities, tpr = rocs_mri[[m]]$sensitivities))),
+  bind_rows(lapply(names(rocs_rel), \(m) data.frame(marker = m, outcome = "Brote clínico",
+    fpr = 1 - rocs_rel[[m]]$specificities, tpr = rocs_rel[[m]]$sensitivities)))
+) |>
+  mutate(outcome = factor(outcome, levels = c("RM activa", "Brote clínico"))) |>
+  arrange(marker, outcome, fpr, tpr)
+
+ggplot(roc_long, aes(fpr, tpr, colour = marker)) +
+  geom_abline(colour = pmenor_col[["linea"]]) +
+  geom_path(linewidth = grosor_pmenor(4)) +
+  scale_colour_manual(values = c(sNfL = pmenor_col[["burdeos"]], RCV = pmenor_col[["tinta"]],
+                                 PBT = pmenor_col[["gris"]])) +
+  scale_x_continuous(breaks = c(0, 0.5, 1), labels = numeros_pmenor()) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), labels = numeros_pmenor()) +
+  coord_equal() +
+  facet_wrap(~ outcome) +
+  labs(x = "1 − especificidad", y = "Sensibilidad", caption = "Datos simulados") +
+  theme(panel.spacing = unit(2, "lines"))
+```
+
+**Puntos de trabajo de RCV y PBT**, con IC de Wilson:
+
+```{r operating-points}
+bind_rows(
+  operating_point(df_roc$mri_active, df_roc$rcv_bin, "RM activa · RCV"),
+  operating_point(df_roc$mri_active, df_roc$pbt_bin, "RM activa · PBT"),
+  operating_point(df_roc$relapse,    df_roc$rcv_bin, "Brote · RCV"),
+  operating_point(df_roc$relapse,    df_roc$pbt_bin, "Brote · PBT")
+)
+```
+
+**Punto de corte óptimo de sNfL continua** (índice de Youden), con IC por
+bootstrap (2.000 remuestreos). El umbral se calcula en log y se devuelve en
+pg/mL.
+
+```{r youden}
+youden_to_pgml <- function(res) {
+  res |> mutate(across(c(estimate, ci_low, ci_high),
+                       \(x) ifelse(metric == "threshold", exp(x), x)),
+                across(where(is.numeric), \(x) round(x, 3)))
+}
+youden_to_pgml(youden_boot(df_roc$mri_active, df_roc$log_nfl))
+youden_to_pgml(youden_boot(df_roc$relapse, df_roc$log_nfl))
+```
+
+> El punto de corte de Youden se calcula y se evalúa con los mismos datos, así
+> que su rendimiento está sobrestimado. Es exploratorio.
+
+### 4.4. Objetivo 4: sNfL y número de lesiones nuevas
+
+Solo determinaciones emparejadas con una RM activa y con el recuento de
+lesiones disponible. En el estudio real, además, solo entraban las RM con una
+RM previa de comparación en el mismo centro en los 2,5 años anteriores.
+
+```{r lesions}
+lesions <- analysis_df |>
+  filter(mri_active == 1, !is.na(n_lesions_w)) |>
+  mutate(log_lesions = log(n_lesions_w + 1))
+
+c(n = nrow(lesions), median_lesions = median(lesions$n_lesions_w))
+
+cor.test(lesions$log_nfl, lesions$n_lesions_w, method = "spearman", exact = FALSE)
+cor.test(lesions$log_nfl, lesions$log_lesions, method = "pearson")   # escala log-log
+
+m_lesions <- lm(log_nfl ~ log_lesions + age + sex, data = lesions)
+summary(m_lesions)
+
+# Cuánto sube la sNfL cada vez que se duplica el número de lesiones
+# (de 1 a 2, de 2 a 4…: el cambio en log(n + 1) varía un poco según el punto)
+b <- coef(m_lesions)[["log_lesions"]]
+round(100 * (exp(b * log(c(3 / 2, 5 / 3, 9 / 5))) - 1), 1)
+```
+
+```{r fig-lesions, fig.cap = "sNfL frente al número de lesiones nuevas en la RM."}
+ggplot(lesions, aes(n_lesions_w, nfl)) +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 1.4) +
+  geom_smooth(method = "lm", formula = y ~ log(x + 1), linewidth = grosor_pmenor(4)) +
+  scale_y_log10(labels = numeros_pmenor()) +
+  labs(x = "Lesiones nuevas en la RM", y = "sNfL (pg/mL, escala log)",
+       caption = "Datos simulados")
+```
+
+**¿A partir de cuántas lesiones se eleva RCV o PBT?** Aquí el número de
+lesiones es el predictor y la positividad de RCV o PBT, la respuesta.
+
+```{r lesions-threshold}
+lesions_b <- lesions |> filter(!is.na(rcv_bin), !is.na(pbt_bin))
+nrow(lesions_b)
+
+bind_rows(lapply(c("rcv_bin", "pbt_bin"), function(marker) {
+  bind_rows(lapply(2:6, function(k)
+    operating_point(lesions_b[[marker]], lesions_b$n_lesions_w >= k,
+                    paste0(toupper(sub("_bin", "", marker)), " · >= ", k, " lesiones"))))
+})) |> select(label, sensitivity, specificity, npv)
+
+for (marker in c("rcv_bin", "pbt_bin")) {
+  r <- roc(lesions_b[[marker]], lesions_b$n_lesions_w, quiet = TRUE, direction = "<", levels = c(0, 1))
+  print(round(c(auc = as.numeric(auc(r)), ci.auc(r, method = "delong")[c(1, 3)]), 3))
+  print(coords(r, "best", best.method = "youden", transpose = FALSE))
+}
+```
+
+> Con tan pocas determinaciones, estos puntos de corte son preliminares.
+
+## 5. Análisis de sensibilidad
+
+### 5.1. Efecto de la edad sin actividad inflamatoria
+
+```{r age-no-activity}
+m_age <- lmer(log_nfl ~ age_c + sex + smoking + (1 | patient_id),
+              data = filter(analysis_m1, relapse == 0, mri_active == 0), REML = TRUE)
+pct_change_table(m_age) |> filter(term == "age_c")
+```
+
+### 5.2. eGFR independiente de la edad
+
+La eGFR baja con la edad. Para separar los dos efectos se sustituye la
+categoría KDIGO por el residuo de la eGFR una vez descontada la edad.
+
+```{r egfr-resid}
+df_egfr <- analysis_m1 |> mutate(egfr_resid = resid(lm(egfr ~ age)))
+m_egfr <- lmer(log_nfl ~ egfr_resid + age_c + relapse + mri_active + sex + smoking +
+                 diabetes + (1 | patient_id), data = df_egfr, REML = TRUE)
+pct_change_table(m_egfr) |> filter(term == "egfr_resid")   # % por cada mL/min/1,73 m²
+```
+
+### 5.3. Interacciones: edad y tabaquismo con la actividad
+
+Test de razón de verosimilitudes (los modelos se ajustan por máxima
+verosimilitud, no REML, para poder compararlos).
+
+```{r interactions}
+m_main <- lmer(log_nfl ~ relapse + mri_active + age_c + t_dx_c + sex + smoking +
+                 egfr_kdigo + diabetes + (1 | patient_id), data = analysis_m1, REML = FALSE)
+
+m_age_int <- update(m_main, . ~ . + relapse:age_c + mri_active:age_c)
+anova(m_main, m_age_int)
+
+m_smk_int <- update(m_main, . ~ . + relapse:smoking + mri_active:smoking)
+anova(m_main, m_smk_int)
+
+# sNfL mediana por tabaquismo, con y sin actividad
+analysis_df |>
+  filter(!is.na(smoking)) |>
+  mutate(activity = ifelse(mri_active == 1 | relapse == 1, "active", "inactive")) |>
+  group_by(smoking, activity) |>
+  summarise(n = n(), nfl_median = round(median(nfl), 1), .groups = "drop") |>
+  pivot_wider(names_from = activity, values_from = c(n, nfl_median))
+
+# Características por tabaquismo
+analysis_df |>
+  filter(!is.na(smoking)) |>
+  group_by(smoking) |>
+  summarise(n = n(), age_median = median(age),
+            egfr_g2_g5_pct = round(100 * mean(egfr_bin == "G2-G5", na.rm = TRUE), 1),
+            mri_active_pct = round(100 * mean(mri_active), 1),
+            relapse_pct = round(100 * mean(relapse), 1))
+```
+
+### 5.4. Solo determinaciones con RM dentro de la ventana
+
+En el análisis principal, una determinación sin RM a ±90 días cuenta como
+"RM inactiva". Es una clasificación conservadora: si hubo actividad no vista,
+diluye el efecto. Aquí se repite el modelo solo con las determinaciones que
+tienen una RM real dentro de la ventana.
+
+```{r within-window}
+m_within <- update(m1, data = filter(analysis_m1, mri_within_w == 1))
+c(determinations = nrow(filter(analysis_m1, mri_within_w == 1)))
+pct_change_table(m_within) |> filter(term %in% c("relapse", "mri_active"))
+```
+
+### 5.5. Otras ventanas temporales: ±60 y ±120 días
+
+```{r windows}
+windows <- bind_rows(lapply(WINDOWS_SENS, function(w) {
+  d <- prepare(w) |> filter(if_all(all_of(model_vars), \(x) !is.na(x)))
+  m <- update(m1, data = d)
+  pct_change_table(m) |>
+    filter(term %in% c("relapse", "mri_active")) |>
+    mutate(window = w, events = c(sum(d$relapse), sum(d$mri_active)))
+}))
+windows |> select(window, term, events, pct_change, ci_low, ci_high)
+```
+
+```{r fig-windows, fig.cap = "Efecto de la actividad sobre la sNfL según la ventana temporal."}
+windows |>
+  mutate(term = ifelse(term == "relapse", "Brote clínico", "RM activa")) |>
+  ggplot(aes(factor(window), pct_change, colour = term, group = term)) +
+  geom_line(position = position_dodge(0.2)) +
+  geom_pointrange(aes(ymin = ci_low, ymax = ci_high), position = position_dodge(0.2)) +
+  scale_colour_manual(values = c(`Brote clínico` = pmenor_col[["burdeos"]],
+                                 `RM activa` = pmenor_col[["tinta"]])) +
+  scale_y_continuous(labels = \(x) paste0(ifelse(x > 0, "+", ""), x, " %"), limits = c(0, NA)) +
+  labs(x = "Ventana temporal (± días)", y = "Cambio en sNfL (IC 95 %)",
+       caption = "Datos simulados")
+```
+
+### 5.6. ROC con una determinación por paciente
+
+Las AUC del apartado 4.3 usan varias determinaciones por paciente. Para ver si
+eso las sesga, se repiten con una sola: la más cercana a un evento activo si
+lo hay y, si no, la más cercana a la RM.
+
+```{r roc-patient-level}
+patient_level_auc <- function(outcome) {
+  d <- df_roc |>
+    group_by(patient_id) |>
+    arrange(desc(.data[[outcome]]), abs(days_nfl_mri), .by_group = TRUE) |>
+    slice(1) |>
+    ungroup()
+  rocs <- list(RCV  = roc(d[[outcome]], d$rcv_bin, quiet = TRUE, direction = "<", levels = c(0, 1)),
+               PBT  = roc(d[[outcome]], d$pbt_bin, quiet = TRUE, direction = "<", levels = c(0, 1)),
+               sNfL = roc(d[[outcome]], d$log_nfl, quiet = TRUE, direction = "<", levels = c(0, 1)))
+  auc_table(rocs) |> mutate(outcome = outcome, patients = nrow(d))
+}
+bind_rows(patient_level_auc("mri_active"), patient_level_auc("relapse"))
+```
+
+## 6. Figuras
+
+Las figuras se guardan en `output/` al ejecutar el documento (secciones 3 a 5).
+
+## 7. Información de la sesión
+
+```{r session}
+sessionInfo()
+```
