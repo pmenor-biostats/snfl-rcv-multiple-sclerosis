@@ -108,12 +108,12 @@ subjects aged 18–90 years. *Neurol Sci.* 2024;45:37.
 ## Cómo reproducirlo
 
 1. Clona el repositorio y abre la carpeta como proyecto de RStudio.
-2. Instala los paquetes:
+2. Instala los paquetes con las mismas versiones que se usaron (quedan
+   registradas en `renv.lock`):
 
    ```r
-   install.packages(c("dplyr", "tidyr", "ggplot2", "data.table", "lme4",
-                      "performance", "sandwich", "lmtest", "pROC",
-                      "rmarkdown", "scales", "svglite", "systemfonts"))
+   install.packages("renv")
+   renv::restore()
    ```
 
 3. Ejecuta `rmarkdown::render("analisis.Rmd")`.
