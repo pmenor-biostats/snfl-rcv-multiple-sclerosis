@@ -82,6 +82,8 @@ source("R/funciones.R")
 source("R/theme_pmenor.R")
 usar_pmenor(base_size = 12, fondo = "papel")
 
+set.seed(2026)   # fija el jitter de las figuras para que se reproduzcan igual
+
 # Ventana temporal para emparejar sNfL con RM y brotes (días)
 WINDOW_DAYS  <- 90
 WINDOWS_SENS <- c(60, 90, 120)   # análisis de sensibilidad
